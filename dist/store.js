@@ -18,6 +18,7 @@ function lotCodeFromProduct(product) {
 async function readData() {
     try {
         const data = JSON.parse(await readFile(file, "utf8"));
+        let changed = false;
         const normalized = {
             products: data.products ?? [],
             categories: data.categories ?? [],
@@ -30,26 +31,48 @@ async function readData() {
             logs: data.logs ?? []
         };
         for (const product of normalized.products) {
+            if (product.onlineAvailable === undefined) {
+                product.onlineAvailable = true;
+                changed = true;
+            }
             const hasLot = normalized.productLots.some((lot) => lot.productId === product.id);
-            if (hasLot)
-                continue;
-            const soldQuantity = normalized.orders
-                .flatMap((order) => order.items)
-                .filter((item) => item.productId === product.id)
-                .reduce((sum, item) => sum + item.quantity, 0);
-            const code = product.lotCode || lotCodeFromProduct(product);
-            product.lotCode = code;
-            normalized.productLots.push({
-                id: crypto.randomUUID(),
-                productId: product.id,
-                code,
-                initialStock: product.stock + soldQuantity,
-                currentStock: product.stock,
-                costPrice: product.costPrice,
-                salePrice: product.salePrice,
-                createdAt: product.createdAt
-            });
+            if (!hasLot) {
+                const soldQuantity = normalized.orders
+                    .flatMap((order) => order.items)
+                    .filter((item) => item.productId === product.id)
+                    .reduce((sum, item) => sum + item.quantity, 0);
+                const code = product.lotCode || lotCodeFromProduct(product);
+                product.lotCode = code;
+                normalized.productLots.push({
+                    id: crypto.randomUUID(),
+                    productId: product.id,
+                    code,
+                    initialStock: product.stock + soldQuantity,
+                    currentStock: product.stock,
+                    costPrice: product.costPrice,
+                    salePrice: product.salePrice,
+                    createdAt: product.createdAt
+                });
+                changed = true;
+            }
+            const lots = normalized.productLots
+                .filter((lot) => lot.productId === product.id && lot.currentStock > 0)
+                .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+            let lotStock = lots.reduce((sum, lot) => sum + lot.currentStock, 0);
+            let excess = lotStock - product.stock;
+            if (excess > 0) {
+                for (const lot of lots) {
+                    if (excess <= 0)
+                        break;
+                    const quantity = Math.min(excess, lot.currentStock);
+                    lot.currentStock -= quantity;
+                    excess -= quantity;
+                }
+                changed = true;
+            }
         }
+        if (changed)
+            await writeData(normalized);
         return normalized;
     }
     catch {

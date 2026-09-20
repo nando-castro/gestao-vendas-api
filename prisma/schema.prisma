@@ -1,0 +1,268 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USUARIO
+  CLIENTE
+}
+
+enum StockMovementType {
+  IN
+  OUT
+  ADJUSTMENT
+}
+
+enum FinanceEntryType {
+  INCOME
+  EXPENSE
+  RECEIVABLE
+}
+
+enum OrderSource {
+  ADMIN
+  CLIENT_PAGE
+}
+
+enum SaleType {
+  AVULSO
+  CLIENTE
+}
+
+enum PaymentMethod {
+  DINHEIRO
+  PIX
+  CARTAO
+  FIADO
+}
+
+enum PaymentStatus {
+  PAID
+  PARTIAL
+  PENDING
+}
+
+enum OrderStatus {
+  OPEN
+  WAITING
+  PREPARING
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum LogType {
+  LOGIN
+  ERROR
+}
+
+enum LogLevel {
+  INFO
+  ERROR
+}
+
+model User {
+  id           String      @id @default(uuid()) @db.Uuid
+  name         String
+  username     String      @unique
+  role         UserRole    @default(USUARIO)
+  passwordHash String
+  salt         String
+  permissions  String[]    @default([])
+  active       Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  cancelledOrders Order[]  @relation("CancelledBy")
+  logs         SystemLog[]
+
+  @@map("users")
+}
+
+model ProductCategory {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  products    Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id              String          @id @default(uuid()) @db.Uuid
+  name            String
+  sku             String          @unique
+  categoryId      String?         @db.Uuid
+  brand           String?
+  productType     String?
+  manufactureDate DateTime?
+  expirationDate  DateTime?
+  lotCode         String?
+  description     String?
+  imageUrl        String?
+  costPrice       Decimal         @default(0) @db.Decimal(12, 2)
+  salePrice       Decimal         @default(0) @db.Decimal(12, 2)
+  stock           Int             @default(0)
+  minStock        Int             @default(0)
+  onlineAvailable Boolean         @default(true)
+  active          Boolean         @default(true)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  category        ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  lots            ProductLot[]
+  stockMovements  StockMovement[]
+  orderItems      OrderItem[]
+
+  @@index([categoryId])
+  @@index([onlineAvailable, active])
+  @@map("products")
+}
+
+model ProductLot {
+  id              String          @id @default(uuid()) @db.Uuid
+  productId       String          @db.Uuid
+  code            String
+  initialStock    Int             @default(0)
+  currentStock    Int             @default(0)
+  costPrice       Decimal         @default(0) @db.Decimal(12, 2)
+  totalCost       Decimal?        @db.Decimal(12, 2)
+  salePrice       Decimal         @default(0) @db.Decimal(12, 2)
+  manufactureDate DateTime?
+  expirationDate  DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems      OrderItem[]
+
+  @@unique([productId, code])
+  @@index([productId, currentStock, createdAt])
+  @@map("product_lots")
+}
+
+model StockMovement {
+  id              String             @id @default(uuid()) @db.Uuid
+  productId       String             @db.Uuid
+  type            StockMovementType
+  quantity        Int
+  totalCost       Decimal?           @db.Decimal(12, 2)
+  costPrice       Decimal?           @db.Decimal(12, 2)
+  salePrice       Decimal?           @db.Decimal(12, 2)
+  manufactureDate DateTime?
+  expirationDate  DateTime?
+  lotCode         String?
+  note            String?
+  createdAt       DateTime           @default(now())
+  product         Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, createdAt])
+  @@map("stock_movements")
+}
+
+model Customer {
+  id              String    @id @default(uuid()) @db.Uuid
+  name            String
+  phone           String?
+  cpf             String?
+  email           String?
+  address         String?
+  notes           String?
+  creditLimit     Decimal   @default(10) @db.Decimal(12, 2)
+  cashbackBalance Decimal   @default(0) @db.Decimal(12, 2)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  orders          Order[]
+
+  @@index([name])
+  @@map("customers")
+}
+
+model Order {
+  id                String        @id @default(uuid()) @db.Uuid
+  saleType          SaleType      @default(CLIENTE)
+  customerId        String?       @db.Uuid
+  customerName      String
+  customerPhone     String?
+  customerCpf       String?
+  paymentMethod     PaymentMethod @default(PIX)
+  paymentStatus     PaymentStatus @default(PAID)
+  source            OrderSource   @default(ADMIN)
+  amountPaid        Decimal       @default(0) @db.Decimal(12, 2)
+  amountDue         Decimal       @default(0) @db.Decimal(12, 2)
+  cashbackUsed      Decimal       @default(0) @db.Decimal(12, 2)
+  cashbackEarned    Decimal       @default(0) @db.Decimal(12, 2)
+  cashbackReleased  Boolean       @default(false)
+  status            OrderStatus   @default(OPEN)
+  cancelledAt       DateTime?
+  cancelledById     String?       @db.Uuid
+  cancelledByName   String?
+  total             Decimal       @default(0) @db.Decimal(12, 2)
+  whatsappUrl       String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  customer          Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  cancelledBy       User?         @relation("CancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  items             OrderItem[]
+
+  @@index([createdAt])
+  @@index([customerId])
+  @@index([source, status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String      @id @default(uuid()) @db.Uuid
+  orderId   String      @db.Uuid
+  productId String      @db.Uuid
+  lotId     String?     @db.Uuid
+  quantity  Int
+  unitPrice Decimal     @db.Decimal(12, 2)
+  costPrice Decimal?    @db.Decimal(12, 2)
+  total     Decimal     @db.Decimal(12, 2)
+  lotCode   String?
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  lot       ProductLot? @relation(fields: [lotId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+model FinanceEntry {
+  id          String           @id @default(uuid()) @db.Uuid
+  type        FinanceEntryType
+  description String
+  amount      Decimal          @db.Decimal(12, 2)
+  category    String?
+  createdAt   DateTime         @default(now())
+
+  @@index([createdAt])
+  @@map("finance_entries")
+}
+
+model SystemLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  type      LogType
+  level     LogLevel
+  userId    String?  @db.Uuid
+  username  String?
+  role      UserRole?
+  action    String
+  route     String?
+  method    String?
+  message   String
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId])
+  @@map("system_logs")
+}

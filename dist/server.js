@@ -1,14 +1,19 @@
 import cors from "cors";
 import { config } from "dotenv";
 import express from "express";
+import { FinanceEntryType, LogLevel, LogType, OrderStatus, PaymentMethod, PaymentStatus, StockMovementType, UserRole as PrismaUserRole } from "@prisma/client";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { prisma } from "./db/client.js";
 import { startKeepAlive } from "./keepAlive.js";
-import { id, snapshot, transact } from "./store.js";
+import { emitInventoryUpdated, emitOrderStatusUpdated, emitProductUpdated, setupRealtime } from "./realtime/socket.js";
+import { createOrderWithStockReservation } from "./services/orders.service.js";
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 const app = express();
+const httpServer = createServer(app);
 const port = Number(process.env.PORT ?? 3333);
 const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173";
 const businessWhatsapp = process.env.BUSINESS_WHATSAPP ?? "";
@@ -26,6 +31,9 @@ const asyncHandler = (handler) => (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
 };
 const money = z.coerce.number().nonnegative();
+const upper = (value) => value.toLocaleUpperCase("pt-BR");
+const normalizeText = (value) => upper(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+const upperString = z.string().transform(upper);
 const allPermissions = [
     "home.view",
     "dashboard.view",
@@ -46,31 +54,145 @@ const allPermissions = [
     "orders.receive",
     "customerOrders.manage",
     "clientPage.view",
+    "clientPage.manage",
     "customers.view",
     "customers.create",
     "customers.edit",
     "users.manage",
     "logs.view"
 ];
+const roleFromDb = (role) => role === "ADMIN" ? "admin" : role === "CLIENTE" ? "cliente" : "usuario";
+const roleToDb = (role) => role === "admin" ? PrismaUserRole.ADMIN : role === "cliente" ? PrismaUserRole.CLIENTE : PrismaUserRole.USUARIO;
+const movementFromDb = (type) => type === "IN" ? "in" : type === "OUT" ? "out" : "adjustment";
+const movementToDb = (type) => type === "in" ? StockMovementType.IN : type === "out" ? StockMovementType.OUT : StockMovementType.ADJUSTMENT;
+const financeFromDb = (type) => type === "EXPENSE" ? "expense" : type === "RECEIVABLE" ? "receivable" : "income";
+const financeToDb = (type) => type === "expense" ? FinanceEntryType.EXPENSE : type === "receivable" ? FinanceEntryType.RECEIVABLE : FinanceEntryType.INCOME;
+const saleTypeFromDb = (type) => type === "AVULSO" ? "avulso" : "cliente";
+const paymentFromDb = (method) => method === "DINHEIRO" ? "dinheiro" : method === "CARTAO" ? "cartao" : method === "FIADO" ? "fiado" : "pix";
+const paymentStatusFromDb = (status) => status === "PARTIAL" ? "partial" : status === "PENDING" ? "pending" : "paid";
+const orderStatusFromDb = (status) => {
+    if (status === "WAITING" || status === "OPEN")
+        return "pending";
+    if (status === "PREPARING")
+        return "preparing";
+    if (status === "READY")
+        return "ready";
+    if (status === "CANCELLED")
+        return "cancelled";
+    return "delivered";
+};
+const orderStatusToDb = (status) => {
+    if (status === "preparing")
+        return OrderStatus.PREPARING;
+    if (status === "ready")
+        return OrderStatus.READY;
+    if (status === "delivered")
+        return OrderStatus.DELIVERED;
+    if (status === "cancelled")
+        return OrderStatus.CANCELLED;
+    return OrderStatus.WAITING;
+};
+const moneyValue = (value) => Number(value ?? 0);
+const iso = (value) => value ? new Date(value).toISOString() : undefined;
+function mapUser(user) {
+    return {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        role: typeof user.role === "string" && user.role === user.role.toUpperCase() ? roleFromDb(user.role) : user.role,
+        passwordHash: user.passwordHash,
+        salt: user.salt,
+        permissions: user.permissions ?? [],
+        active: user.active,
+        createdAt: iso(user.createdAt) ?? new Date().toISOString(),
+        updatedAt: iso(user.updatedAt) ?? new Date().toISOString()
+    };
+}
+function mapProduct(product) {
+    return {
+        ...product,
+        costPrice: moneyValue(product.costPrice),
+        salePrice: moneyValue(product.salePrice),
+        manufactureDate: iso(product.manufactureDate) ?? "",
+        expirationDate: iso(product.expirationDate) ?? "",
+        createdAt: iso(product.createdAt),
+        updatedAt: iso(product.updatedAt),
+        lots: product.lots?.map(mapLot)
+    };
+}
+function mapLot(lot) {
+    return {
+        ...lot,
+        costPrice: moneyValue(lot.costPrice),
+        totalCost: lot.totalCost === null ? undefined : moneyValue(lot.totalCost),
+        salePrice: moneyValue(lot.salePrice),
+        manufactureDate: iso(lot.manufactureDate) ?? "",
+        expirationDate: iso(lot.expirationDate) ?? "",
+        createdAt: iso(lot.createdAt)
+    };
+}
+function mapCustomer(customer) {
+    return {
+        ...customer,
+        creditLimit: moneyValue(customer.creditLimit),
+        cashbackBalance: moneyValue(customer.cashbackBalance),
+        createdAt: iso(customer.createdAt) ?? new Date().toISOString(),
+        updatedAt: iso(customer.updatedAt) ?? new Date().toISOString()
+    };
+}
+function mapOrder(order) {
+    return {
+        id: order.id,
+        source: order.source === "CLIENT_PAGE" ? "client_page" : "admin",
+        saleType: saleTypeFromDb(order.saleType),
+        customerId: order.customerId ?? undefined,
+        customerName: order.customerName,
+        customerPhone: order.customerPhone ?? "",
+        paymentMethod: paymentFromDb(order.paymentMethod),
+        paymentStatus: paymentStatusFromDb(order.paymentStatus),
+        amountPaid: moneyValue(order.amountPaid),
+        amountDue: moneyValue(order.amountDue),
+        cashbackUsed: moneyValue(order.cashbackUsed),
+        cashbackEarned: moneyValue(order.cashbackEarned),
+        cashbackReleased: order.cashbackReleased,
+        status: orderStatusFromDb(order.status),
+        cancelledAt: iso(order.cancelledAt),
+        cancelledBy: order.cancelledById ?? undefined,
+        cancelledByName: order.cancelledByName ?? undefined,
+        total: moneyValue(order.total),
+        whatsappUrl: order.whatsappUrl ?? undefined,
+        createdAt: iso(order.createdAt),
+        items: (order.items ?? []).map((item) => ({
+            id: item.id,
+            productId: item.productId,
+            quantity: item.quantity,
+            unitPrice: moneyValue(item.unitPrice),
+            costPrice: item.costPrice === null ? undefined : moneyValue(item.costPrice),
+            lotCode: item.lotCode ?? undefined,
+            product: item.product ? mapProduct(item.product) : undefined
+        }))
+    };
+}
 const productSchema = z.object({
-    name: z.string().min(2),
+    name: z.string().min(2).transform(upper),
     sku: z.string().optional().default(""),
     categoryId: z.string().optional().default(""),
-    brand: z.string().optional().default(""),
+    brand: upperString.optional().default(""),
     productType: z.string().optional().default(""),
     manufactureDate: z.string().optional().default(""),
     expirationDate: z.string().optional().default(""),
-    description: z.string().optional().nullable(),
+    description: upperString.optional().nullable(),
     imageUrl: z.string().optional().nullable(),
     costPrice: money.default(0),
     salePrice: money,
     stock: z.coerce.number().int().min(0).default(0),
     minStock: z.coerce.number().int().min(0).default(0),
+    onlineAvailable: z.boolean().default(true),
     active: z.boolean().default(true)
 });
 const categorySchema = z.object({
-    name: z.string().min(2),
-    description: z.string().optional().default(""),
+    name: z.string().min(2).transform(upper),
+    description: upperString.optional().default(""),
     active: z.boolean().default(true)
 });
 const imageSearchSchema = z.object({
@@ -81,7 +203,7 @@ const imageImportSchema = z.object({
 });
 const financeSchema = z.object({
     type: z.enum(["income", "expense", "receivable"]),
-    description: z.string().min(2),
+    description: z.string().min(2).transform(upper),
     amount: money,
     category: z.string().optional()
 });
@@ -96,13 +218,16 @@ const stockSchema = z.object({
     expirationDate: z.string().optional().default(""),
     note: z.string().optional()
 });
+const lotUpdateSchema = z.object({
+    salePrice: money
+});
 const customerSchema = z.object({
-    name: z.string().min(2),
+    name: z.string().min(2).transform(upper),
     phone: z.string().optional().default(""),
     cpf: z.string().optional().default(""),
-    email: z.string().optional().default(""),
-    address: z.string().optional().default(""),
-    notes: z.string().optional().default(""),
+    email: upperString.optional().default(""),
+    address: upperString.optional().default(""),
+    notes: upperString.optional().default(""),
     creditLimit: money.default(10),
     cashbackBalance: money.optional()
 });
@@ -110,7 +235,7 @@ const orderSchema = z.object({
     source: z.enum(["admin", "client_page"]).optional().default("admin"),
     saleType: z.enum(["avulso", "cliente"]).default("cliente"),
     customerId: z.string().optional(),
-    customerName: z.string().optional().default(""),
+    customerName: upperString.optional().default(""),
     customerPhone: z.string().optional().default(""),
     customerCpf: z.string().optional().default(""),
     paymentMethod: z.enum(["dinheiro", "pix", "cartao", "fiado"]).default("pix"),
@@ -132,7 +257,7 @@ const loginSchema = z.object({
     password: z.string().min(1)
 });
 const userSchema = z.object({
-    name: z.string().min(2),
+    name: z.string().min(2).transform(upper),
     username: z.string().min(2),
     password: z.string().min(4).optional(),
     role: z.enum(["usuario", "cliente"]).default("usuario"),
@@ -167,30 +292,35 @@ function publicUser(user) {
     return { ...safe, permissions: user.role === "admin" ? allPermissions : user.permissions };
 }
 async function writeLog(log) {
-    await transact((db) => {
-        db.logs.push({ id: id(), ...log, createdAt: new Date().toISOString() });
-        if (db.logs.length > 500)
-            db.logs.splice(0, db.logs.length - 500);
+    await prisma.systemLog.create({
+        data: {
+            type: log.type === "login" ? LogType.LOGIN : LogType.ERROR,
+            level: log.level === "error" ? LogLevel.ERROR : LogLevel.INFO,
+            userId: log.userId,
+            username: log.username,
+            role: log.role ? roleToDb(log.role) : undefined,
+            action: log.action,
+            route: log.route,
+            method: log.method,
+            message: log.message
+        }
     });
 }
 async function ensureAdminUser() {
-    await transact((db) => {
-        if (db.users.some((user) => user.role === "admin"))
-            return;
-        const now = new Date().toISOString();
-        const { salt, passwordHash } = hashPassword(process.env.ADMIN_PASSWORD ?? "admin123");
-        db.users.push({
-            id: id(),
+    const admin = await prisma.user.findFirst({ where: { role: PrismaUserRole.ADMIN } });
+    if (admin)
+        return;
+    const { salt, passwordHash } = hashPassword(process.env.ADMIN_PASSWORD ?? "admin123");
+    await prisma.user.create({
+        data: {
             name: process.env.ADMIN_NAME ?? "Administrador",
             username: process.env.ADMIN_USERNAME ?? "admin",
-            role: "admin",
+            role: PrismaUserRole.ADMIN,
             salt,
             passwordHash,
             permissions: allPermissions,
-            active: true,
-            createdAt: now,
-            updatedAt: now
-        });
+            active: true
+        }
     });
 }
 const requireAuth = asyncHandler(async (req, res, next) => {
@@ -198,8 +328,8 @@ const requireAuth = asyncHandler(async (req, res, next) => {
     const session = verifyToken(token);
     if (!session)
         throw new AppError("Login necessario", 401);
-    const data = await snapshot();
-    const user = data.users.find((item) => item.id === session.id && item.active);
+    const dbUser = await prisma.user.findFirst({ where: { id: session.id, active: true } });
+    const user = dbUser ? mapUser(dbUser) : undefined;
     if (!user)
         throw new AppError("Usuario inativo ou nao encontrado", 401);
     res.locals.user = user;
@@ -267,6 +397,34 @@ function nextLotCode(db, sku) {
     }, 0);
     return `${prefix}${String(last + 1).padStart(3, "0")}`;
 }
+async function nextSkuDb(name, categoryId, brand) {
+    const category = categoryId ? await prisma.productCategory.findUnique({ where: { id: categoryId } }) : undefined;
+    const prefix = `${skuPart(category?.name ?? "", "SEM")}-${skuPart(brand || name, "MAR")}-`;
+    const products = await prisma.product.findMany({ where: { sku: { startsWith: prefix } }, select: { sku: true } });
+    const last = products.reduce((max, product) => {
+        const number = Number(product.sku.slice(prefix.length));
+        return Number.isFinite(number) ? Math.max(max, number) : max;
+    }, 0);
+    return `${prefix}${String(last + 1).padStart(3, "0")}`;
+}
+async function nextLotCodeDb(sku) {
+    const prefix = lotPrefixFromSku(sku);
+    const [products, lots, movements] = await Promise.all([
+        prisma.product.findMany({ where: { lotCode: { startsWith: prefix } }, select: { lotCode: true } }),
+        prisma.productLot.findMany({ where: { code: { startsWith: prefix } }, select: { code: true } }),
+        prisma.stockMovement.findMany({ where: { lotCode: { startsWith: prefix } }, select: { lotCode: true } })
+    ]);
+    const codes = [
+        ...products.map((product) => product.lotCode),
+        ...lots.map((lot) => lot.code),
+        ...movements.map((movement) => movement.lotCode)
+    ].filter(Boolean);
+    const last = codes.reduce((max, code) => {
+        const number = Number(code.slice(prefix.length));
+        return Number.isFinite(number) ? Math.max(max, number) : max;
+    }, 0);
+    return `${prefix}${String(last + 1).padStart(3, "0")}`;
+}
 function cashbackDiscount(balance, total) {
     if (balance < 1)
         return 0;
@@ -299,8 +457,10 @@ app.get("/health", (_req, res) => {
 app.post("/auth/login", asyncHandler(async (req, res) => {
     await ensureAdminUser();
     const data = loginSchema.parse(req.body);
-    const db = await snapshot();
-    const user = db.users.find((item) => item.username.toLowerCase() === data.username.toLowerCase() && item.active);
+    const dbUser = await prisma.user.findFirst({
+        where: { username: { equals: data.username, mode: "insensitive" }, active: true }
+    });
+    const user = dbUser ? mapUser(dbUser) : undefined;
     if (!user || !verifyPassword(data.password, user)) {
         await writeLog({
             type: "error",
@@ -330,85 +490,93 @@ app.get("/auth/me", requireAuth, asyncHandler(async (_req, res) => {
     res.json({ user: publicUser(res.locals.user), permissions: allPermissions });
 }));
 app.get("/users", requireAuth, requirePermission("users.manage"), asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    res.json(data.users.map(publicUser).sort((a, b) => a.name.localeCompare(b.name)));
+    const users = await prisma.user.findMany({ orderBy: { name: "asc" } });
+    res.json(users.map((user) => publicUser(mapUser(user))));
 }));
 app.post("/users", requireAuth, requirePermission("users.manage"), asyncHandler(async (req, res) => {
     const data = userSchema.parse(req.body);
-    const now = new Date().toISOString();
-    const created = await transact((db) => {
-        if (db.users.some((user) => user.username.toLowerCase() === data.username.toLowerCase()))
-            throw new AppError("Usuario ja cadastrado");
-        const { salt, passwordHash } = hashPassword(data.password ?? "123456");
-        const user = { id: id(), name: data.name, username: data.username, role: data.role, permissions: data.permissions, active: data.active, salt, passwordHash, createdAt: now, updatedAt: now };
-        db.users.push(user);
-        return user;
+    const existing = await prisma.user.findFirst({ where: { username: { equals: data.username, mode: "insensitive" } } });
+    if (existing)
+        throw new AppError("Usuario ja cadastrado");
+    const { salt, passwordHash } = hashPassword(data.password ?? "123456");
+    const created = await prisma.user.create({
+        data: {
+            name: data.name,
+            username: data.username,
+            role: roleToDb(data.role),
+            permissions: data.permissions,
+            active: data.active,
+            salt,
+            passwordHash
+        }
     });
-    res.status(201).json(publicUser(created));
+    res.status(201).json(publicUser(mapUser(created)));
 }));
 app.put("/users/:id", requireAuth, requirePermission("users.manage"), asyncHandler(async (req, res) => {
     const data = userSchema.partial().parse(req.body);
-    const updated = await transact((db) => {
-        const current = db.users.find((user) => user.id === req.params.id);
-        if (!current)
-            throw new AppError("Usuario nao encontrado", 404);
-        if (current.role === "admin")
-            throw new AppError("Permissoes do ADMIN nao podem ser editadas", 403);
-        if (data.username && db.users.some((user) => user.id !== current.id && user.username.toLowerCase() === data.username.toLowerCase()))
+    const current = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!current)
+        throw new AppError("Usuario nao encontrado", 404);
+    if (current.role === PrismaUserRole.ADMIN)
+        throw new AppError("Permissoes do ADMIN nao podem ser editadas", 403);
+    if (data.username) {
+        const existing = await prisma.user.findFirst({ where: { id: { not: current.id }, username: { equals: data.username, mode: "insensitive" } } });
+        if (existing)
             throw new AppError("Usuario ja cadastrado");
-        Object.assign(current, {
-            name: data.name ?? current.name,
-            username: data.username ?? current.username,
-            role: data.role ?? current.role,
-            permissions: data.permissions ?? current.permissions,
-            active: data.active ?? current.active,
-            updatedAt: new Date().toISOString()
-        });
-        if (data.password)
-            Object.assign(current, hashPassword(data.password));
-        return current;
+    }
+    const passwordData = data.password ? hashPassword(data.password) : {};
+    const updated = await prisma.user.update({
+        where: { id: current.id },
+        data: {
+            name: data.name,
+            username: data.username,
+            role: data.role ? roleToDb(data.role) : undefined,
+            permissions: data.permissions,
+            active: data.active,
+            ...passwordData
+        }
     });
-    res.json(publicUser(updated));
+    res.json(publicUser(mapUser(updated)));
 }));
 app.get("/logs", requireAuth, requirePermission("logs.view"), asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    res.json(data.logs.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 250));
+    const logs = await prisma.systemLog.findMany({ orderBy: { createdAt: "desc" }, take: 250 });
+    res.json(logs.map((log) => ({
+        ...log,
+        type: log.type === "LOGIN" ? "login" : "error",
+        level: log.level === "ERROR" ? "error" : "info",
+        role: log.role ? roleFromDb(log.role) : undefined,
+        createdAt: log.createdAt.toISOString()
+    })));
 }));
 app.get("/categories", asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    res.json(data.categories.sort((a, b) => a.name.localeCompare(b.name)));
+    const categories = await prisma.productCategory.findMany({ orderBy: { name: "asc" } });
+    res.json(categories.map((category) => ({ ...category, createdAt: category.createdAt.toISOString(), updatedAt: category.updatedAt.toISOString() })));
 }));
 app.post("/categories", requireAuth, requirePermission("categories.create"), asyncHandler(async (req, res) => {
     const data = categorySchema.parse(req.body);
-    const now = new Date().toISOString();
-    const category = await transact((db) => {
-        if (db.categories.some((item) => item.name.toLowerCase() === data.name.toLowerCase()))
-            throw new AppError("Categoria ja cadastrada");
-        const created = { id: id(), ...data, createdAt: now, updatedAt: now };
-        db.categories.push(created);
-        return created;
+    const existing = await prisma.productCategory.findFirst({ where: { name: { equals: data.name, mode: "insensitive" } } });
+    if (existing)
+        throw new AppError("Categoria ja cadastrada");
+    const category = await prisma.productCategory.create({
+        data
     });
     res.status(201).json(category);
 }));
 app.put("/categories/:id", requireAuth, requirePermission("categories.edit"), asyncHandler(async (req, res) => {
     const data = categorySchema.partial().parse(req.body);
-    const category = await transact((db) => {
-        const current = db.categories.find((item) => item.id === req.params.id);
-        if (!current)
-            throw new AppError("Categoria nao encontrada", 404);
-        if (data.name && db.categories.some((item) => item.id !== current.id && item.name.toLowerCase() === data.name.toLowerCase()))
+    const current = await prisma.productCategory.findUnique({ where: { id: req.params.id } });
+    if (!current)
+        throw new AppError("Categoria nao encontrada", 404);
+    if (data.name) {
+        const existing = await prisma.productCategory.findFirst({ where: { id: { not: current.id }, name: { equals: data.name, mode: "insensitive" } } });
+        if (existing)
             throw new AppError("Categoria ja cadastrada");
-        Object.assign(current, data, { updatedAt: new Date().toISOString() });
-        return current;
-    });
+    }
+    const category = await prisma.productCategory.update({ where: { id: current.id }, data });
     res.json(category);
 }));
 app.delete("/categories/:id", requireAuth, requirePermission("categories.edit"), asyncHandler(async (req, res) => {
-    await transact((db) => {
-        const category = db.categories.find((item) => item.id === req.params.id);
-        if (category)
-            category.active = false;
-    });
+    await prisma.productCategory.update({ where: { id: req.params.id }, data: { active: false } }).catch(() => undefined);
     res.status(204).send();
 }));
 app.get("/images/search", requireAuth, requirePermission("products.create"), asyncHandler(async (req, res) => {
@@ -441,328 +609,289 @@ app.post("/images/import", requireAuth, requirePermission("products.create"), as
     res.json({ imageUrl: `data:${contentType};base64,${bytes.toString("base64")}` });
 }));
 app.get("/products", asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    res.json(data.products
-        .filter((product) => product.active)
-        .map((product) => ({ ...product, category: data.categories.find((category) => category.id === product.categoryId), lots: data.productLots.filter((lot) => lot.productId === product.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) }))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    const products = await prisma.product.findMany({
+        where: { active: true },
+        include: { category: true, lots: { orderBy: { createdAt: "desc" } } },
+        orderBy: { createdAt: "desc" }
+    });
+    res.json(products.map(mapProduct));
 }));
 app.post("/products", asyncHandler(async (req, res) => {
     const data = productSchema.parse(req.body);
-    const now = new Date().toISOString();
-    const product = await transact((db) => {
-        const sku = data.sku?.trim() || nextSku(db, data.name, data.categoryId, data.brand);
-        if (sku && db.products.some((item) => item.active && item.sku === sku))
-            throw new AppError("SKU ja cadastrado");
-        const productType = data.productType?.trim() || data.name;
-        const lotCode = nextLotCode(db, sku);
-        const created = { id: id(), ...data, sku, productType, lotCode, createdAt: now, updatedAt: now };
-        db.products.push(created);
+    const sku = data.sku?.trim() || await nextSkuDb(data.name, data.categoryId, data.brand);
+    const existing = await prisma.product.findFirst({ where: { active: true, sku } });
+    if (existing)
+        throw new AppError("SKU ja cadastrado");
+    const productType = data.productType?.trim() || data.name;
+    const lotCode = await nextLotCodeDb(sku);
+    const product = await prisma.$transaction(async (tx) => {
+        const created = await tx.product.create({
+            data: {
+                ...data,
+                sku,
+                productType,
+                lotCode,
+                categoryId: data.categoryId || undefined,
+                manufactureDate: data.manufactureDate ? new Date(data.manufactureDate) : undefined,
+                expirationDate: data.expirationDate ? new Date(data.expirationDate) : undefined
+            }
+        });
         if (created.stock > 0) {
-            db.productLots.push({
-                id: id(),
-                productId: created.id,
-                code: lotCode,
-                initialStock: created.stock,
-                currentStock: created.stock,
-                costPrice: created.costPrice,
-                salePrice: created.salePrice,
-                createdAt: now
+            await tx.productLot.create({
+                data: {
+                    productId: created.id,
+                    code: lotCode,
+                    initialStock: created.stock,
+                    currentStock: created.stock,
+                    costPrice: created.costPrice,
+                    salePrice: created.salePrice
+                }
             });
-            db.stockMovements.push({ id: id(), productId: created.id, type: "in", quantity: created.stock, lotCode, note: `Lote inicial ${lotCode}`, createdAt: now });
+            await tx.stockMovement.create({
+                data: { productId: created.id, type: StockMovementType.IN, quantity: created.stock, lotCode, note: `Lote inicial ${lotCode}` }
+            });
         }
         return created;
     });
-    res.status(201).json(product);
+    emitInventoryUpdated({ productId: product.id, stock: product.stock, onlineAvailable: product.onlineAvailable });
+    res.status(201).json(mapProduct(product));
 }));
 app.put("/products/:id", requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     const data = productSchema.partial().parse(req.body);
-    const product = await transact((db) => {
-        const current = db.products.find((item) => item.id === req.params.id);
-        if (!current)
-            throw new AppError("Produto nao encontrado", 404);
-        Object.assign(current, data, { updatedAt: new Date().toISOString() });
-        return current;
+    const current = await prisma.product.findUnique({ where: { id: req.params.id } });
+    if (!current)
+        throw new AppError("Produto nao encontrado", 404);
+    const product = await prisma.product.update({
+        where: { id: current.id },
+        data: {
+            ...data,
+            categoryId: data.categoryId || undefined,
+            manufactureDate: data.manufactureDate ? new Date(data.manufactureDate) : undefined,
+            expirationDate: data.expirationDate ? new Date(data.expirationDate) : undefined
+        }
     });
-    res.json(product);
+    emitProductUpdated(product.id);
+    emitInventoryUpdated({ productId: product.id, stock: product.stock, onlineAvailable: product.onlineAvailable });
+    res.json(mapProduct(product));
 }));
 app.delete("/products/:id", requireAuth, requireAdmin, asyncHandler(async (req, res) => {
-    await transact((db) => {
-        const product = db.products.find((item) => item.id === req.params.id);
-        if (product)
-            product.active = false;
-    });
+    const product = await prisma.product.update({ where: { id: req.params.id }, data: { active: false } }).catch(() => null);
+    if (product)
+        emitProductUpdated(product.id);
     res.status(204).send();
 }));
 app.get("/stock", asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    const movements = data.stockMovements
-        .map((movement) => ({ ...movement, product: data.products.find((product) => product.id === movement.productId) }))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .slice(0, 80);
-    res.json(movements);
+    const movements = await prisma.stockMovement.findMany({ include: { product: true }, orderBy: { createdAt: "desc" }, take: 80 });
+    res.json(movements.map((movement) => ({
+        ...movement,
+        type: movementFromDb(movement.type),
+        totalCost: movement.totalCost === null ? undefined : moneyValue(movement.totalCost),
+        costPrice: movement.costPrice === null ? undefined : moneyValue(movement.costPrice),
+        salePrice: movement.salePrice === null ? undefined : moneyValue(movement.salePrice),
+        manufactureDate: iso(movement.manufactureDate) ?? "",
+        expirationDate: iso(movement.expirationDate) ?? "",
+        createdAt: movement.createdAt.toISOString(),
+        product: movement.product ? mapProduct(movement.product) : undefined
+    })));
 }));
 app.post("/stock", asyncHandler(async (req, res) => {
     const data = stockSchema.parse(req.body);
     const delta = data.type === "out" ? -data.quantity : data.quantity;
-    const result = await transact((db) => {
-        const product = db.products.find((item) => item.id === data.productId);
+    const result = await prisma.$transaction(async (tx) => {
+        const [product] = await tx.$queryRaw `
+      SELECT id, sku, name, stock, "lotCode", "costPrice", "salePrice"
+      FROM products
+      WHERE id = ${data.productId}::uuid
+      FOR UPDATE
+    `;
         if (!product)
             throw new AppError("Produto nao encontrado", 404);
-        const lotCode = data.type === "in" ? nextLotCode(db, product.sku || product.name) : product.lotCode;
-        const unitCost = data.costPrice ?? (data.totalCost !== undefined ? Number((data.totalCost / data.quantity).toFixed(2)) : product.costPrice);
-        const salePrice = data.salePrice ?? product.salePrice;
-        if (data.type !== "adjustment")
-            product.stock += delta;
+        const lotCode = data.type === "in" ? await nextLotCodeDb(product.sku || product.name) : product.lotCode;
+        const unitCost = data.costPrice ?? (data.totalCost !== undefined ? Number((data.totalCost / data.quantity).toFixed(2)) : moneyValue(product.costPrice));
+        const salePrice = data.salePrice ?? moneyValue(product.salePrice);
+        if (data.type === "out" && product.stock < data.quantity)
+            throw new AppError(`Estoque insuficiente: ${product.name}`);
+        if (data.type !== "adjustment") {
+            await tx.product.update({ where: { id: product.id }, data: { stock: { increment: delta } } });
+        }
         if (data.type === "in") {
-            const newLotCode = lotCode ?? nextLotCode(db, product.sku || product.name);
-            product.lotCode = newLotCode;
-            product.costPrice = unitCost;
-            db.productLots.push({
-                id: id(),
-                productId: product.id,
-                code: newLotCode,
-                initialStock: data.quantity,
-                currentStock: data.quantity,
-                costPrice: unitCost,
-                totalCost: data.totalCost ?? Number((unitCost * data.quantity).toFixed(2)),
-                salePrice,
-                manufactureDate: data.manufactureDate,
-                expirationDate: data.expirationDate,
-                createdAt: new Date().toISOString()
+            const newLotCode = lotCode ?? await nextLotCodeDb(product.sku || product.name);
+            await tx.product.update({ where: { id: product.id }, data: { lotCode: newLotCode, costPrice: unitCost } });
+            await tx.productLot.create({
+                data: {
+                    productId: product.id,
+                    code: newLotCode,
+                    initialStock: data.quantity,
+                    currentStock: data.quantity,
+                    costPrice: unitCost,
+                    totalCost: data.totalCost ?? Number((unitCost * data.quantity).toFixed(2)),
+                    salePrice,
+                    manufactureDate: data.manufactureDate ? new Date(data.manufactureDate) : undefined,
+                    expirationDate: data.expirationDate ? new Date(data.expirationDate) : undefined
+                }
             });
         }
-        product.updatedAt = new Date().toISOString();
-        const movement = { id: id(), ...data, lotCode, createdAt: new Date().toISOString() };
-        db.stockMovements.push(movement);
-        return { movement, product };
+        if (data.type === "out") {
+            await tx.$queryRaw `SELECT id FROM product_lots WHERE "productId" = ${product.id}::uuid ORDER BY "createdAt", code FOR UPDATE`;
+            let remaining = data.quantity;
+            const lots = await tx.productLot.findMany({ where: { productId: product.id, currentStock: { gt: 0 } }, orderBy: [{ createdAt: "asc" }, { code: "asc" }] });
+            for (const lot of lots) {
+                if (remaining <= 0)
+                    break;
+                const quantity = Math.min(remaining, lot.currentStock);
+                await tx.productLot.update({ where: { id: lot.id }, data: { currentStock: { decrement: quantity } } });
+                remaining -= quantity;
+            }
+        }
+        const movement = await tx.stockMovement.create({
+            data: {
+                productId: product.id,
+                type: movementToDb(data.type),
+                quantity: data.quantity,
+                totalCost: data.totalCost,
+                costPrice: data.costPrice,
+                salePrice: data.salePrice,
+                manufactureDate: data.manufactureDate ? new Date(data.manufactureDate) : undefined,
+                expirationDate: data.expirationDate ? new Date(data.expirationDate) : undefined,
+                lotCode,
+                note: data.note
+            }
+        });
+        const updatedProduct = await tx.product.findUniqueOrThrow({ where: { id: product.id } });
+        return { movement, product: updatedProduct };
     });
-    res.status(201).json(result);
+    emitInventoryUpdated({ productId: result.product.id, stock: result.product.stock, onlineAvailable: result.product.onlineAvailable });
+    res.status(201).json({ movement: { ...result.movement, type: movementFromDb(result.movement.type), createdAt: result.movement.createdAt.toISOString() }, product: mapProduct(result.product) });
+}));
+app.put("/lots/:id", requireAuth, requirePermission("stock.move"), asyncHandler(async (req, res) => {
+    const data = lotUpdateSchema.parse(req.body);
+    const lot = await prisma.productLot.update({ where: { id: req.params.id }, data: { salePrice: data.salePrice } }).catch(() => null);
+    if (!lot)
+        throw new AppError("Lote nao encontrado", 404);
+    emitProductUpdated(lot.productId);
+    res.json(mapLot(lot));
 }));
 app.get("/finance", asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    res.json(data.financeEntries.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    const entries = await prisma.financeEntry.findMany({ orderBy: { createdAt: "desc" } });
+    res.json(entries.map((entry) => ({ ...entry, type: financeFromDb(entry.type), amount: moneyValue(entry.amount), createdAt: entry.createdAt.toISOString() })));
 }));
 app.post("/finance", asyncHandler(async (req, res) => {
     const data = financeSchema.parse(req.body);
-    const entry = await transact((db) => {
-        const created = { id: id(), ...data, createdAt: new Date().toISOString() };
-        db.financeEntries.push(created);
-        return created;
-    });
-    res.status(201).json(entry);
+    const entry = await prisma.financeEntry.create({ data: { ...data, type: financeToDb(data.type) } });
+    res.status(201).json({ ...entry, type: financeFromDb(entry.type), amount: moneyValue(entry.amount), createdAt: entry.createdAt.toISOString() });
 }));
 app.get("/customers", asyncHandler(async (req, res) => {
-    const q = String(req.query.q ?? "").toLowerCase().replace(/\D/g, "");
-    const raw = String(req.query.q ?? "").toLowerCase();
-    const data = await snapshot();
-    const customers = data.customers
+    const q = String(req.query.q ?? "").replace(/\D/g, "");
+    const raw = normalizeText(String(req.query.q ?? ""));
+    const customers = await prisma.customer.findMany({ orderBy: { name: "asc" }, take: 200 });
+    const filtered = customers
         .filter((customer) => {
         if (!raw)
             return true;
-        return customer.name.toLowerCase().includes(raw)
+        return normalizeText(customer.name).includes(raw)
             || (q.length > 0 && (customer.phone ?? "").replace(/\D/g, "").includes(q))
             || (q.length > 0 && (customer.cpf ?? "").replace(/\D/g, "").includes(q));
     })
         .sort((a, b) => a.name.localeCompare(b.name))
         .slice(0, 30);
-    res.json(customers);
+    res.json(filtered.map(mapCustomer));
 }));
 app.post("/customers", asyncHandler(async (req, res) => {
     const data = customerSchema.parse(req.body);
-    const now = new Date().toISOString();
-    const customer = await transact((db) => {
-        const existing = db.customers.find((item) => (data.phone && item.phone === data.phone) || (data.cpf && item.cpf === data.cpf));
-        if (existing) {
-            Object.assign(existing, data, { updatedAt: now });
-            return existing;
-        }
-        const created = { id: id(), ...data, cashbackBalance: data.cashbackBalance ?? 0, createdAt: now, updatedAt: now };
-        db.customers.push(created);
-        return created;
-    });
-    res.status(201).json(customer);
+    const customerFilters = [
+        ...(data.phone ? [{ phone: data.phone }] : []),
+        ...(data.cpf ? [{ cpf: data.cpf }] : [])
+    ];
+    const existing = customerFilters.length ? await prisma.customer.findFirst({ where: { OR: customerFilters } }) : null;
+    const customer = existing
+        ? await prisma.customer.update({ where: { id: existing.id }, data })
+        : await prisma.customer.create({ data: { ...data, cashbackBalance: data.cashbackBalance ?? 0 } });
+    res.status(201).json(mapCustomer(customer));
 }));
 app.put("/customers/:id", asyncHandler(async (req, res) => {
     const data = customerSchema.partial().parse(req.body);
-    const customer = await transact((db) => {
-        const current = db.customers.find((item) => item.id === req.params.id);
-        if (!current)
-            throw new AppError("Cliente nao encontrado", 404);
-        Object.assign(current, data, { updatedAt: new Date().toISOString() });
-        return current;
-    });
-    res.json(customer);
+    const customer = await prisma.customer.update({ where: { id: req.params.id }, data }).catch(() => null);
+    if (!customer)
+        throw new AppError("Cliente nao encontrado", 404);
+    res.json(mapCustomer(customer));
 }));
 app.get("/orders", asyncHandler(async (_req, res) => {
-    const data = await snapshot();
-    const orders = data.orders
-        .map((order) => ({ ...order, items: order.items.map((item) => ({ ...item, product: data.products.find((product) => product.id === item.productId) })) }))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    res.json(orders);
+    const orders = await prisma.order.findMany({
+        include: { items: { include: { product: true } } },
+        orderBy: { createdAt: "desc" }
+    });
+    res.json(orders.map(mapOrder));
 }));
 app.post("/orders", asyncHandler(async (req, res) => {
     const data = orderSchema.parse(req.body);
-    const order = await transact((db) => {
-        let customer;
-        if (data.saleType === "cliente") {
-            customer = data.customerId ? db.customers.find((item) => item.id === data.customerId) : undefined;
-            if (!customer) {
-                const name = data.customerName.trim();
-                if (!name)
-                    throw new AppError("Informe o nome do cliente");
-                const now = new Date().toISOString();
-                customer = {
-                    id: id(),
-                    name,
-                    phone: data.customerPhone,
-                    cpf: data.customerCpf,
-                    creditLimit: 10,
-                    cashbackBalance: 0,
-                    createdAt: now,
-                    updatedAt: now
-                };
-                db.customers.push(customer);
-            }
-        }
-        const lines = [];
-        let total = 0;
-        const items = data.items.flatMap((item) => {
-            const product = db.products.find((candidate) => candidate.id === item.productId && candidate.active);
-            if (!product)
-                throw new AppError("Produto indisponivel");
-            if (product.stock < item.quantity)
-                throw new AppError(`Estoque insuficiente: ${product.name}`);
-            total += product.salePrice * item.quantity;
-            lines.push(`${item.quantity}x ${product.name} - R$ ${(product.salePrice * item.quantity).toFixed(2)}`);
-            let remaining = item.quantity;
-            const lots = db.productLots
-                .filter((lot) => lot.productId === item.productId && lot.currentStock > 0)
-                .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-            const soldItems = [];
-            for (const lot of lots) {
-                if (remaining <= 0)
-                    break;
-                const quantity = Math.min(remaining, lot.currentStock);
-                lot.currentStock -= quantity;
-                remaining -= quantity;
-                soldItems.push({
-                    id: id(),
-                    productId: item.productId,
-                    quantity,
-                    unitPrice: product.salePrice,
-                    costPrice: lot.costPrice,
-                    lotCode: lot.code
-                });
-            }
-            if (remaining > 0) {
-                soldItems.push({ id: id(), productId: item.productId, quantity: remaining, unitPrice: product.salePrice, costPrice: product.costPrice, lotCode: product.lotCode });
-            }
-            return soldItems;
+    if (data.saleType === "avulso" && data.paymentMethod === "fiado") {
+        throw new AppError("Fiado so pode ser usado para cliente cadastrado.");
+    }
+    if (data.paymentMethod === "fiado" && data.saleType !== "cliente") {
+        throw new AppError("Venda fiada precisa ser para cliente cadastrado");
+    }
+    let customer = data.customerId ? await prisma.customer.findUnique({ where: { id: data.customerId } }) : null;
+    if (data.saleType === "cliente" && !customer) {
+        const name = data.customerName.trim();
+        if (!name)
+            throw new AppError("Informe o nome do cliente");
+        customer = await prisma.customer.create({
+            data: { name, phone: data.customerPhone, cpf: data.customerCpf, creditLimit: 10, cashbackBalance: 0 }
         });
-        if (data.paymentMethod === "fiado" && data.saleType !== "cliente") {
-            throw new AppError("Venda fiada precisa ser para cliente cadastrado");
-        }
-        const cashbackUsed = data.useCashback && customer ? cashbackDiscount(Number(customer.cashbackBalance ?? 0), total) : 0;
-        if (data.useCashback && !customer)
-            throw new AppError("Cashback so pode ser usado por cliente cadastrado");
-        if (cashbackUsed > 0 && customer) {
-            customer.cashbackBalance = Number((Number(customer.cashbackBalance ?? 0) - cashbackUsed).toFixed(2));
-        }
-        const payableTotal = Math.max(total - cashbackUsed, 0);
-        const amountPaid = data.paymentMethod === "fiado" ? Math.min(Number(data.amountPaid ?? 0), payableTotal) : payableTotal;
-        const amountDue = Math.max(payableTotal - amountPaid, 0);
-        if (data.paymentMethod === "fiado" && customer) {
-            const currentDebt = db.orders
-                .filter((order) => order.customerId === customer?.id)
-                .reduce((sum, order) => sum + Number(order.amountDue ?? 0), 0);
-            const creditLimit = Number(customer.creditLimit ?? 10);
-            if (currentDebt + amountDue > creditLimit) {
-                throw new AppError(`Limite de fiado excedido. Limite: R$ ${creditLimit.toFixed(2)}`);
-            }
-        }
-        const paymentStatus = amountDue <= 0 ? "paid" : amountPaid > 0 ? "partial" : "pending";
-        const created = {
-            id: id(),
-            source: data.source,
-            saleType: data.saleType,
-            customerId: customer?.id,
-            customerName: customer?.name ?? (data.customerName || "Avulso"),
-            customerPhone: customer?.phone ?? data.customerPhone,
-            paymentMethod: data.paymentMethod,
-            paymentStatus,
-            amountPaid,
-            amountDue,
-            cashbackUsed,
-            cashbackEarned: 0,
-            cashbackReleased: data.paymentMethod !== "fiado",
-            status: "pending",
-            total,
-            createdAt: new Date().toISOString(),
-            items
-        };
-        created.whatsappUrl = whatsappUrl(created.id, data.customerName, lines, total);
-        db.orders.push(created);
-        if (customer && (data.paymentMethod === "pix" || data.paymentMethod === "dinheiro") && amountDue <= 0 && amountPaid > 0) {
-            const earned = Number((amountPaid * 0.1).toFixed(2));
-            customer.cashbackBalance = Number((Number(customer.cashbackBalance ?? 0) + earned).toFixed(2));
-            created.cashbackEarned = earned;
-        }
-        for (const item of items) {
-            const product = db.products.find((candidate) => candidate.id === item.productId);
-            if (!product)
-                continue;
-            product.stock -= item.quantity;
-            product.updatedAt = new Date().toISOString();
-            db.stockMovements.push({ id: id(), productId: item.productId, type: "out", quantity: item.quantity, lotCode: item.lotCode, note: `Pedido ${created.id}`, createdAt: new Date().toISOString() });
-        }
-        if (amountPaid > 0) {
-            db.financeEntries.push({
-                id: id(),
-                type: "income",
-                description: `Pagamento venda ${created.id} - ${data.paymentMethod}`,
-                amount: amountPaid,
-                category: `Vendas/${data.paymentMethod}`,
-                createdAt: created.createdAt
-            });
-        }
-        if (amountDue > 0) {
-            db.financeEntries.push({
-                id: id(),
-                type: "receivable",
-                description: `A receber venda ${created.id}`,
-                amount: amountDue,
-                category: "Vendas/fiado",
-                createdAt: created.createdAt
-            });
-        }
-        return { ...created, items: created.items.map((item) => ({ ...item, product: db.products.find((product) => product.id === item.productId) })) };
+    }
+    if (data.paymentMethod === "fiado" && customer) {
+        const debt = await prisma.order.aggregate({ where: { customerId: customer.id, amountDue: { gt: 0 } }, _sum: { amountDue: true } });
+        const itemsPreview = await prisma.product.findMany({ where: { id: { in: data.items.map((item) => item.productId) } }, select: { id: true, salePrice: true } });
+        const previewTotal = data.items.reduce((sum, item) => {
+            const product = itemsPreview.find((candidate) => candidate.id === item.productId);
+            return sum + moneyValue(product?.salePrice) * item.quantity;
+        }, 0);
+        const currentDebt = moneyValue(debt._sum.amountDue);
+        const creditLimit = moneyValue(customer.creditLimit);
+        const amountPaid = Number(data.amountPaid ?? 0);
+        const duePreview = Math.max(previewTotal - amountPaid, 0);
+        if (currentDebt + duePreview > creditLimit)
+            throw new AppError(`Limite de fiado excedido. Limite: R$ ${creditLimit.toFixed(2)}`);
+    }
+    const created = await createOrderWithStockReservation({
+        source: data.source,
+        saleType: data.saleType,
+        customerId: customer?.id,
+        customerName: customer?.name ?? (data.customerName || "Avulso"),
+        customerPhone: customer?.phone ?? data.customerPhone,
+        customerCpf: customer?.cpf ?? data.customerCpf,
+        paymentMethod: data.paymentMethod,
+        amountPaid: data.paymentMethod === "fiado" ? Number(data.amountPaid ?? 0) : undefined,
+        items: data.items
     });
-    res.status(201).json(order);
+    const order = await prisma.order.findUniqueOrThrow({ where: { id: created.id }, include: { items: { include: { product: true } } } });
+    res.status(201).json(mapOrder(order));
 }));
 app.post("/orders/:id/payments", asyncHandler(async (req, res) => {
     const data = paymentSchema.parse(req.body);
-    const order = await transact((db) => {
-        const current = db.orders.find((item) => item.id === req.params.id);
+    const order = await prisma.$transaction(async (tx) => {
+        const current = await tx.order.findUnique({ where: { id: req.params.id } });
         if (!current)
             throw new AppError("Venda nao encontrada", 404);
-        const amount = Math.min(data.amount, current.amountDue ?? 0);
-        current.amountPaid = Number(current.amountPaid ?? 0) + amount;
-        current.amountDue = Math.max(Number(current.amountDue ?? 0) - amount, 0);
-        current.paymentStatus = current.amountDue <= 0 ? "paid" : "partial";
-        const customer = current.customerId ? db.customers.find((item) => item.id === current.customerId) : undefined;
-        maybeReleaseFiadoCashback(current, customer);
-        db.financeEntries.push({
-            id: id(),
-            type: "income",
-            description: `Pagamento recebido venda ${current.id}`,
-            amount,
-            category: "Vendas/fiado",
-            createdAt: new Date().toISOString()
+        const amount = Math.min(data.amount, moneyValue(current.amountDue));
+        const amountPaid = moneyValue(current.amountPaid) + amount;
+        const amountDue = Math.max(moneyValue(current.amountDue) - amount, 0);
+        const updated = await tx.order.update({
+            where: { id: current.id },
+            data: { amountPaid, amountDue, paymentStatus: amountDue <= 0 ? PaymentStatus.PAID : PaymentStatus.PARTIAL },
+            include: { items: { include: { product: true } } }
         });
-        return current;
+        await tx.financeEntry.create({
+            data: {
+                type: FinanceEntryType.INCOME,
+                description: `Pagamento recebido venda ${current.id}`,
+                amount,
+                category: "Vendas/fiado"
+            }
+        });
+        return updated;
     });
-    res.json(order);
+    res.json(mapOrder(order));
 }));
 app.put("/orders/:id/payment", asyncHandler(async (req, res) => {
     const data = z.object({
@@ -770,35 +899,41 @@ app.put("/orders/:id/payment", asyncHandler(async (req, res) => {
         paymentStatus: z.enum(["paid", "partial", "pending"]).optional(),
         amountPaid: money.optional()
     }).parse(req.body);
-    const order = await transact((db) => {
-        const current = db.orders.find((item) => item.id === req.params.id);
-        if (!current)
-            throw new AppError("Venda nao encontrada", 404);
-        if (data.paymentMethod)
-            current.paymentMethod = data.paymentMethod;
-        if (data.amountPaid !== undefined) {
-            current.amountPaid = Math.min(data.amountPaid, current.total);
-            current.amountDue = Math.max(current.total - current.amountPaid, 0);
+    const current = await prisma.order.findUnique({ where: { id: req.params.id } });
+    if (!current)
+        throw new AppError("Venda nao encontrada", 404);
+    let amountPaid = moneyValue(current.amountPaid);
+    let amountDue = moneyValue(current.amountDue);
+    let paymentStatus = current.paymentStatus;
+    if (data.amountPaid !== undefined) {
+        amountPaid = Math.min(data.amountPaid, moneyValue(current.total));
+        amountDue = Math.max(moneyValue(current.total) - amountPaid, 0);
+    }
+    if (data.paymentStatus) {
+        paymentStatus = data.paymentStatus === "paid" ? PaymentStatus.PAID : data.paymentStatus === "partial" ? PaymentStatus.PARTIAL : PaymentStatus.PENDING;
+        if (paymentStatus === PaymentStatus.PAID) {
+            amountPaid = moneyValue(current.total);
+            amountDue = 0;
         }
-        if (data.paymentStatus) {
-            current.paymentStatus = data.paymentStatus;
-            if (data.paymentStatus === "paid") {
-                current.amountPaid = current.total;
-                current.amountDue = 0;
-            }
-            if (data.paymentStatus === "pending") {
-                current.amountPaid = 0;
-                current.amountDue = current.total;
-            }
+        if (paymentStatus === PaymentStatus.PENDING) {
+            amountPaid = 0;
+            amountDue = moneyValue(current.total);
         }
-        else {
-            current.paymentStatus = current.amountDue <= 0 ? "paid" : current.amountPaid > 0 ? "partial" : "pending";
-        }
-        const customer = current.customerId ? db.customers.find((item) => item.id === current.customerId) : undefined;
-        maybeReleaseFiadoCashback(current, customer);
-        return current;
+    }
+    else {
+        paymentStatus = amountDue <= 0 ? PaymentStatus.PAID : amountPaid > 0 ? PaymentStatus.PARTIAL : PaymentStatus.PENDING;
+    }
+    const order = await prisma.order.update({
+        where: { id: current.id },
+        data: {
+            paymentMethod: data.paymentMethod ? (data.paymentMethod === "dinheiro" ? PaymentMethod.DINHEIRO : data.paymentMethod === "cartao" ? PaymentMethod.CARTAO : data.paymentMethod === "fiado" ? PaymentMethod.FIADO : PaymentMethod.PIX) : undefined,
+            paymentStatus,
+            amountPaid,
+            amountDue
+        },
+        include: { items: { include: { product: true } } }
     });
-    res.json(order);
+    res.json(mapOrder(order));
 }));
 app.put("/orders/:id/status", requireAuth, requirePermission("customerOrders.manage"), asyncHandler(async (req, res) => {
     const data = z.object({
@@ -812,69 +947,65 @@ app.put("/orders/:id/status", requireAuth, requirePermission("customerOrders.man
         if (data.removalKey !== expectedKey)
             throw new AppError("Chave de seguranca invalida", 403);
     }
-    const order = await transact((db) => {
-        const current = db.orders.find((item) => item.id === req.params.id);
+    const order = await prisma.$transaction(async (tx) => {
+        const current = await tx.order.findUnique({ where: { id: req.params.id }, include: { items: true } });
         if (!current)
             throw new AppError("Pedido nao encontrado", 404);
-        const wasCancelled = current.status === "cancelled";
-        current.status = data.status;
+        const wasCancelled = current.status === OrderStatus.CANCELLED;
         if (data.status === "cancelled" && !wasCancelled) {
-            current.cancelledAt = now;
-            current.cancelledBy = user.id;
-            current.cancelledByName = user.name;
             for (const item of current.items) {
-                const product = db.products.find((candidate) => candidate.id === item.productId);
-                if (!product)
-                    continue;
-                product.stock += item.quantity;
-                product.updatedAt = now;
-                const lot = item.lotCode ? db.productLots.find((candidate) => candidate.code === item.lotCode && candidate.productId === item.productId) : undefined;
-                if (lot)
-                    lot.currentStock += item.quantity;
-                db.stockMovements.push({
-                    id: id(),
-                    productId: item.productId,
-                    type: "in",
-                    quantity: item.quantity,
-                    lotCode: item.lotCode ?? product.lotCode,
-                    note: `Cancelamento pedido ${current.id}`,
-                    createdAt: now
+                await tx.product.update({ where: { id: item.productId }, data: { stock: { increment: item.quantity } } });
+                if (item.lotId)
+                    await tx.productLot.update({ where: { id: item.lotId }, data: { currentStock: { increment: item.quantity } } });
+                await tx.stockMovement.create({
+                    data: {
+                        productId: item.productId,
+                        type: StockMovementType.IN,
+                        quantity: item.quantity,
+                        lotCode: item.lotCode,
+                        note: `Cancelamento pedido ${current.id}`
+                    }
                 });
             }
         }
-        return current;
+        return tx.order.update({
+            where: { id: current.id },
+            data: {
+                status: orderStatusToDb(data.status),
+                cancelledAt: data.status === "cancelled" && !wasCancelled ? new Date(now) : current.cancelledAt,
+                cancelledById: data.status === "cancelled" && !wasCancelled ? user.id : current.cancelledById,
+                cancelledByName: data.status === "cancelled" && !wasCancelled ? user.name : current.cancelledByName
+            },
+            include: { items: { include: { product: true } } }
+        });
     });
-    res.json(order);
+    emitOrderStatusUpdated(order.id, data.status);
+    res.json(mapOrder(order));
 }));
 app.delete("/orders/:id", asyncHandler(async (req, res) => {
     const data = deleteOrderSchema.parse(req.body);
     const expectedKey = (process.env.REMOVAL_KEY ?? "admin-remover").trim().replace(/^["']|["']$/g, "");
     if (data.removalKey !== expectedKey)
         throw new AppError("Chave de remocao invalida", 403);
-    await transact((db) => {
-        const index = db.orders.findIndex((item) => item.id === req.params.id);
-        if (index < 0)
+    await prisma.$transaction(async (tx) => {
+        const removed = await tx.order.findUnique({ where: { id: req.params.id }, include: { items: true } });
+        if (!removed)
             throw new AppError("Venda nao encontrada", 404);
-        const [removed] = db.orders.splice(index, 1);
         for (const item of removed.items) {
-            const product = db.products.find((candidate) => candidate.id === item.productId);
-            if (!product)
-                continue;
-            product.stock += item.quantity;
-            product.updatedAt = new Date().toISOString();
-            const lot = item.lotCode ? db.productLots.find((candidate) => candidate.code === item.lotCode && candidate.productId === item.productId) : undefined;
-            if (lot)
-                lot.currentStock += item.quantity;
-            db.stockMovements.push({
-                id: id(),
-                productId: item.productId,
-                type: "in",
-                quantity: item.quantity,
-                lotCode: item.lotCode ?? product.lotCode,
-                note: `Estorno venda ${removed.id}`,
-                createdAt: new Date().toISOString()
+            await tx.product.update({ where: { id: item.productId }, data: { stock: { increment: item.quantity } } });
+            if (item.lotId)
+                await tx.productLot.update({ where: { id: item.lotId }, data: { currentStock: { increment: item.quantity } } });
+            await tx.stockMovement.create({
+                data: {
+                    productId: item.productId,
+                    type: StockMovementType.IN,
+                    quantity: item.quantity,
+                    lotCode: item.lotCode,
+                    note: `Estorno venda ${removed.id}`
+                }
             });
         }
+        await tx.order.delete({ where: { id: removed.id } });
     });
     res.status(204).send();
 }));
@@ -885,8 +1016,8 @@ app.use(async (error, req, res, _next) => {
     if (req.originalUrl !== "/logs") {
         const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
         const session = verifyToken(token);
-        const db = await snapshot().catch(() => null);
-        const user = session && db ? db.users.find((item) => item.id === session.id) : undefined;
+        const dbUser = session ? await prisma.user.findUnique({ where: { id: session.id } }).catch(() => null) : null;
+        const user = dbUser ? mapUser(dbUser) : undefined;
         await writeLog({
             type: "error",
             level: "error",
@@ -905,7 +1036,8 @@ app.use(async (error, req, res, _next) => {
         return res.status(error.status).json({ error: error.message });
     return res.status(500).json({ error: "Erro interno" });
 });
-app.listen(port, () => {
+setupRealtime(httpServer, frontendUrl);
+httpServer.listen(port, () => {
     console.log(`API running on http://localhost:${port}`);
     startKeepAlive();
 });
