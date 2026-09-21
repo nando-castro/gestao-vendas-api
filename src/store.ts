@@ -75,6 +75,7 @@ export type Customer = {
   name: string;
   phone?: string;
   cpf?: string;
+  birthday?: string;
   email?: string;
   address?: string;
   notes?: string;

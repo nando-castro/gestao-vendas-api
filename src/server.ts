@@ -165,6 +165,7 @@ function mapLot(lot: any) {
 function mapCustomer(customer: any): Customer {
   return {
     ...customer,
+    birthday: iso(customer.birthday) ?? "",
     creditLimit: moneyValue(customer.creditLimit),
     cashbackBalance: moneyValue(customer.cashbackBalance),
     createdAt: iso(customer.createdAt) ?? new Date().toISOString(),
@@ -265,6 +266,7 @@ const customerSchema = z.object({
   name: z.string().min(2).transform(upper),
   phone: z.string().optional().default(""),
   cpf: z.string().optional().default(""),
+  birthday: z.string().optional().default(""),
   email: upperString.optional().default(""),
   address: upperString.optional().default(""),
   notes: upperString.optional().default(""),
@@ -279,6 +281,7 @@ const orderSchema = z.object({
   customerName: upperString.optional().default(""),
   customerPhone: z.string().optional().default(""),
   customerCpf: z.string().optional().default(""),
+  customerBirthday: z.string().optional().default(""),
   paymentMethod: z.enum(["dinheiro", "pix", "cartao", "fiado"]).default("pix"),
   amountPaid: money.optional(),
   useCashback: z.coerce.boolean().optional().default(false),
@@ -879,20 +882,28 @@ app.get("/customers", asyncHandler(async (req, res) => {
 
 app.post("/customers", asyncHandler(async (req, res) => {
   const data = customerSchema.parse(req.body);
+  const payload = {
+    ...data,
+    birthday: data.birthday ? new Date(data.birthday) : null
+  };
   const customerFilters = [
     ...(data.phone ? [{ phone: data.phone }] : []),
     ...(data.cpf ? [{ cpf: data.cpf }] : [])
   ];
   const existing = customerFilters.length ? await prisma.customer.findFirst({ where: { OR: customerFilters } }) : null;
   const customer = existing
-    ? await prisma.customer.update({ where: { id: existing.id }, data })
-    : await prisma.customer.create({ data: { ...data, cashbackBalance: data.cashbackBalance ?? 0 } });
+    ? await prisma.customer.update({ where: { id: existing.id }, data: payload })
+    : await prisma.customer.create({ data: { ...payload, cashbackBalance: data.cashbackBalance ?? 0 } });
   res.status(201).json(mapCustomer(customer));
 }));
 
 app.put("/customers/:id", asyncHandler(async (req, res) => {
   const data = customerSchema.partial().parse(req.body);
-  const customer = await prisma.customer.update({ where: { id: req.params.id }, data }).catch(() => null);
+  const payload = {
+    ...data,
+    birthday: data.birthday === undefined ? undefined : data.birthday ? new Date(data.birthday) : null
+  };
+  const customer = await prisma.customer.update({ where: { id: req.params.id }, data: payload }).catch(() => null);
   if (!customer) throw new AppError("Cliente nao encontrado", 404);
   res.json(mapCustomer(customer));
 }));
@@ -932,7 +943,14 @@ app.post("/orders", asyncHandler(async (req, res) => {
     const name = data.customerName.trim();
     if (!name) throw new AppError("Informe o nome do cliente");
     customer = await prisma.customer.create({
-      data: { name, phone: data.customerPhone, cpf: data.customerCpf, creditLimit: 10, cashbackBalance: 0 }
+      data: {
+        name,
+        phone: data.customerPhone,
+        cpf: data.customerCpf,
+        birthday: data.customerBirthday ? new Date(data.customerBirthday) : null,
+        creditLimit: 10,
+        cashbackBalance: 0
+      }
     });
   }
   if (data.paymentMethod === "fiado" && customer) {

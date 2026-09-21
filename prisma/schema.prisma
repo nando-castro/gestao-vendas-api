@@ -171,6 +171,7 @@ model Customer {
   name            String
   phone           String?
   cpf             String?
+  birthday        DateTime?
   email           String?
   address         String?
   notes           String?
