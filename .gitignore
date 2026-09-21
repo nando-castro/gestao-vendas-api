@@ -6,6 +6,11 @@ dist/
 !.env.example
 
 data/
+uploads/*
+!uploads/.gitkeep
+!uploads/products/
+uploads/products/*
+!uploads/products/.gitkeep
 *.db
 *.db-journal
 

@@ -1,9 +1,11 @@
 import cors from "cors";
 import { config } from "dotenv";
 import express from "express";
+import multer from "multer";
 import { FinanceEntryType, LogLevel, LogType, OrderStatus, PaymentMethod, PaymentStatus, StockMovementType, UserRole as PrismaUserRole } from "@prisma/client";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -18,8 +20,20 @@ const port = Number(process.env.PORT ?? 3333);
 const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173";
 const businessWhatsapp = process.env.BUSINESS_WHATSAPP ?? "";
 const authSecret = process.env.AUTH_SECRET ?? process.env.REMOVAL_KEY ?? "pedidos-pro-secret";
+const uploadRoot = resolve(process.env.UPLOAD_DIR ?? "./uploads");
+const productUploadDir = resolve(uploadRoot, "products");
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 6 * 1024 * 1024 },
+    fileFilter: (_req, file, callback) => {
+        if (!file.mimetype.startsWith("image/"))
+            return callback(new AppError("Arquivo selecionado nao e uma imagem"));
+        callback(null, true);
+    }
+});
 app.use(cors({ origin: [frontendUrl, "http://localhost:5173"], credentials: true }));
 app.use(express.json({ limit: "8mb" }));
+app.use("/uploads", express.static(uploadRoot));
 class AppError extends Error {
     status;
     constructor(message, status = 400) {
@@ -357,6 +371,21 @@ function slug(value) {
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "produto";
 }
+function imageExtension(contentType) {
+    if (contentType.includes("png"))
+        return "png";
+    if (contentType.includes("webp"))
+        return "webp";
+    if (contentType.includes("gif"))
+        return "gif";
+    return "jpg";
+}
+async function saveProductImage(bytes, contentType, name = "produto") {
+    await mkdir(productUploadDir, { recursive: true });
+    const filename = `${Date.now()}-${slug(name)}-${randomUUID()}.${imageExtension(contentType)}`;
+    await writeFile(resolve(productUploadDir, filename), bytes);
+    return `/uploads/products/${filename}`;
+}
 function skuPart(value, fallback) {
     const letters = value
         .normalize("NFD")
@@ -606,7 +635,13 @@ app.post("/images/import", requireAuth, requirePermission("products.create"), as
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.byteLength > 6 * 1024 * 1024)
         throw new AppError("Imagem muito grande");
-    res.json({ imageUrl: `data:${contentType};base64,${bytes.toString("base64")}` });
+    res.json({ imageUrl: await saveProductImage(bytes, contentType, "produto-importado") });
+}));
+app.post("/images/upload", requireAuth, requirePermission("products.create"), upload.single("image"), asyncHandler(async (req, res) => {
+    if (!req.file)
+        throw new AppError("Envie uma imagem.");
+    const productName = String(req.body.name ?? "produto");
+    res.status(201).json({ imageUrl: await saveProductImage(req.file.buffer, req.file.mimetype, productName) });
 }));
 app.get("/products", asyncHandler(async (_req, res) => {
     const products = await prisma.product.findMany({
