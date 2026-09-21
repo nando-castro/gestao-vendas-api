@@ -44,6 +44,7 @@ const upload = multer({
     callback(null, true);
   }
 });
+const uploadProductImage = upload.single("image") as unknown as express.RequestHandler;
 
 app.use(cors({ origin: [frontendUrl, "http://localhost:5173"], credentials: true }));
 app.use(express.json({ limit: "8mb" }));
@@ -677,7 +678,7 @@ app.post("/images/import", requireAuth, requirePermission("products.create"), as
   res.json({ imageUrl: await saveProductImage(bytes, contentType, "produto-importado") });
 }));
 
-app.post("/images/upload", requireAuth, requirePermission("products.create"), upload.single("image"), asyncHandler(async (req, res) => {
+app.post("/images/upload", requireAuth, requirePermission("products.create"), uploadProductImage, asyncHandler(async (req, res) => {
   if (!req.file) throw new AppError("Envie uma imagem.");
   const productName = String(req.body.name ?? "produto");
   res.status(201).json({ imageUrl: await saveProductImage(req.file.buffer, req.file.mimetype, productName) });
