@@ -65,6 +65,7 @@ const asyncHandler =
 const money = z.coerce.number().nonnegative();
 const upper = (value: string) => value.toLocaleUpperCase("pt-BR");
 const normalizeText = (value: string) => upper(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+const onlyDigits = (value: string) => value.replace(/\D/g, "");
 const upperString = z.string().transform(upper);
 
 const allPermissions = [
@@ -896,6 +897,12 @@ app.put("/customers/:id", asyncHandler(async (req, res) => {
   res.json(mapCustomer(customer));
 }));
 
+app.delete("/customers/:id", requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const customer = await prisma.customer.delete({ where: { id: req.params.id } }).catch(() => null);
+  if (!customer) throw new AppError("Cliente nao encontrado", 404);
+  res.status(204).send();
+}));
+
 app.get("/orders", asyncHandler(async (_req, res) => {
   const orders = await prisma.order.findMany({
     include: { items: { include: { product: true } } },
@@ -913,6 +920,14 @@ app.post("/orders", asyncHandler(async (req, res) => {
     throw new AppError("Venda fiada precisa ser para cliente cadastrado");
   }
   let customer = data.customerId ? await prisma.customer.findUnique({ where: { id: data.customerId } }) : null;
+  if (data.source === "client_page") {
+    const phoneDigits = onlyDigits(data.customerPhone);
+    if (phoneDigits.length < 10) throw new AppError("Telefone obrigatorio para pedido online");
+    if (!customer) {
+      const customers = await prisma.customer.findMany({ where: { phone: { not: "" } } });
+      customer = customers.find((item) => onlyDigits(item.phone ?? "") === phoneDigits) ?? null;
+    }
+  }
   if (data.saleType === "cliente" && !customer) {
     const name = data.customerName.trim();
     if (!name) throw new AppError("Informe o nome do cliente");
